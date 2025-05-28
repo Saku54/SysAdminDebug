@@ -1,0 +1,411 @@
+<#
+.SYNOPSIS
+    Outil tout-en-un de diagnostic pour machine virtuelle (VM) sous Windows.
+
+.DESCRIPTION
+    Interface graphique pour effectuer des tests de santé système :
+    - Espace disque
+    - Charge CPU / RAM
+    - Connectivité réseau (ping)
+    - État de certains ports
+    - Vérification mises à jour (Windows Update / WSUS)
+    - Erreurs système (logs)
+    - Recherche utilisateur AD
+
+.VERSION
+    1.0 - 2025-05-28
+#>
+
+# Chargement des bibliothèques .NET nécessaires à WinForms
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Liste des tests disponibles à cocher dans le formulaire
+$TestsDisponibles = @(
+    "Espace disque",
+    "Utilisation CPU / RAM",
+    "Connectivité réseau",
+    "Test port et firewall",
+    "Mises à jour Windows",
+    "WSUS",
+    "Logs systèmes",
+    "Recherche utilisateur AD"
+)
+
+###############################################################
+###                 INTERFACE UTILISATEUR                    ###
+###############################################################
+
+function Show-VMHealthForm {
+    # Création du formulaire principal
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Diagnostic VM - Outil tout-en-un"
+    $form.Size = New-Object System.Drawing.Size(600,750)
+    $form.StartPosition = "CenterScreen"
+
+    # Label d'introduction
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Sélectionnez les tests à effectuer :"
+    $label.Location = New-Object System.Drawing.Point(20,20)
+    $label.AutoSize = $true
+    $form.Controls.Add($label)
+
+    # Dictionnaire de checkboxes
+    $checkboxes = @{}
+    $y = 50  # position Y initiale
+
+    # Création des checkboxes et champs conditionnels (IP, Port, etc.)
+    foreach ($test in $TestsDisponibles) {
+        # Checkbox pour chaque test
+        $cb = New-Object System.Windows.Forms.CheckBox
+        $cb.Text = $test
+        $cb.Location = New-Object System.Drawing.Point(40, $y)
+        $cb.AutoSize = $true
+        $form.Controls.Add($cb)
+        $checkboxes[$test] = $cb
+
+        # --- Champs spécifiques pour certains tests ---
+        if ($test -eq "Connectivité réseau") {
+            # IP à tester (initialement cachée)
+            $txtIP = New-Object System.Windows.Forms.TextBox
+            $txtIP.Name = "txtIP"
+            $txtIP.Size = New-Object System.Drawing.Size(120, 20)
+            $txtIP.Location = New-Object System.Drawing.Point(200, $y)
+            $txtIP.Text = "127.0.0.1"
+            $txtIP.Visible = $false
+            $form.Controls.Add($txtIP)
+
+            $lblIP = New-Object System.Windows.Forms.Label
+            $lblIP.Text = "IP Destination"
+            $lblIP.Location = New-Object System.Drawing.Point(330, ($y + 3))
+            $lblIP.AutoSize = $true
+            $lblIP.Visible = $false
+            $form.Controls.Add($lblIP)
+        }
+
+        if ($test -eq "Test port et firewall") {
+            # Port à tester (initialement caché)
+            $txtPort = New-Object System.Windows.Forms.TextBox
+            $txtPort.Name = "txtPort"
+            $txtPort.Size = New-Object System.Drawing.Size(60, 20)
+            $txtPort.Location = New-Object System.Drawing.Point(200, $y)
+            $txtPort.Text = ""
+            $txtPort.Visible = $false
+            $form.Controls.Add($txtPort)
+
+            $lblPort = New-Object System.Windows.Forms.Label
+            $lblPort.Text = "Port à tester"
+            $lblPort.Location = New-Object System.Drawing.Point(270, ($y + 3))
+            $lblPort.AutoSize = $true
+            $lblPort.Visible = $false
+            $form.Controls.Add($lblPort)
+        }
+
+        $y += 30  # incrément pour positionner le contrôle suivant
+    }
+
+    # --- Champs pour Recherche AD ---
+    $txtSam = New-Object System.Windows.Forms.TextBox
+    $txtSam.Name = "txtSam"
+    $txtSam.Size = New-Object System.Drawing.Size(150, 20)
+    $txtSam.Location = New-Object System.Drawing.Point(250, (50 + (30 * ($TestsDisponibles.IndexOf("Recherche utilisateur AD")))))
+    $txtSam.Visible = $false
+    $form.Controls.Add($txtSam)
+
+    $lblSam = New-Object System.Windows.Forms.Label
+    $lblSam.Text = "sAMAccountName"
+    $lblSam.Location = New-Object System.Drawing.Point(410, $txtSam.Location.Y + 3)
+    $lblSam.AutoSize = $true
+    $lblSam.Visible = $false
+    $form.Controls.Add($lblSam)
+
+    $txtDC = New-Object System.Windows.Forms.TextBox
+    $txtDC.Name = "txtDC"
+    $txtDC.Size = New-Object System.Drawing.Size(120, 20)
+    $txtDC.Location = New-Object System.Drawing.Point(250, $txtSam.Location.Y + 30)
+    $txtDC.Text = "DC=mondomaine,DC=local"
+    $txtDC.Visible = $false
+    $form.Controls.Add($txtDC)
+
+    $lblDC = New-Object System.Windows.Forms.Label
+    $lblDC.Text = "Base de recherche (DC)"
+    $lblDC.Location = New-Object System.Drawing.Point(380, $txtDC.Location.Y + 3)
+    $lblDC.AutoSize = $true
+    $lblDC.Visible = $false
+    $form.Controls.Add($lblDC)
+
+    $btnSearchUser = New-Object System.Windows.Forms.Button
+    $btnSearchUser.Text = "Rechercher utilisateur"
+    $btnSearchUser.Location = New-Object System.Drawing.Point(250, $txtDC.Location.Y + 30)
+    $btnSearchUser.Size = New-Object System.Drawing.Size(150,25)
+    $btnSearchUser.Visible = $false
+    $form.Controls.Add($btnSearchUser)
+
+    # --- Bouton principal : lancer l'audit ---
+    $buttonRun = New-Object System.Windows.Forms.Button
+    $buttonRun.Text = "Lancer l'audit"
+    $buttonRun.Location = New-Object System.Drawing.Point(40, ($y + 10))
+    $buttonRun.Size = New-Object System.Drawing.Size(100,30)
+    $form.Controls.Add($buttonRun)
+
+    # --- Zone de texte pour résultats ---
+    $resultsBox = New-Object System.Windows.Forms.TextBox
+    $resultsBox.Multiline = $true
+    $resultsBox.ScrollBars = "Vertical"
+    $resultsBox.Size = New-Object System.Drawing.Size(520,300)
+    $resultsBox.Location = New-Object System.Drawing.Point(40, ($y + 60))
+    $resultsBox.Font = New-Object System.Drawing.Font("Consolas",10)
+    $form.Controls.Add($resultsBox)
+
+    # --- Barre de progression dynamique ---
+    $progressBar = New-Object System.Windows.Forms.ProgressBar
+    $progressBar.Size = New-Object System.Drawing.Size(520, 20)
+    $progressBar.Location = New-Object System.Drawing.Point(40, ($y + 370))
+    $progressBar.Minimum = 0
+    $progressBar.Maximum = 100
+    $progressBar.Value = 0
+    $form.Controls.Add($progressBar)
+
+    # --- Gestion dynamique des champs conditionnels ---
+    $checkboxes["Recherche utilisateur AD"].Add_CheckedChanged({
+        $checked = $checkboxes["Recherche utilisateur AD"].Checked
+        $txtSam.Visible = $checked
+        $lblSam.Visible = $checked
+        $txtDC.Visible = $checked
+        $lblDC.Visible = $checked
+        $btnSearchUser.Visible = $checked
+    })
+
+    $checkboxes["Connectivité réseau"].Add_CheckedChanged({
+        $checked = $checkboxes["Connectivité réseau"].Checked
+        $txtIP.Visible = $checked
+        $lblIP.Visible = $checked
+    })
+
+    $checkboxes["Test port et firewall"].Add_CheckedChanged({
+        $checked = $checkboxes["Test port et firewall"].Checked
+        $txtPort.Visible = $checked
+        $lblPort.Visible = $checked
+    })
+
+    # --- Action : Recherche AD immédiate ---
+    $btnSearchUser.Add_Click({
+        $samAccountName = $txtSam.Text
+        $searchBase = $txtDC.Text
+        $result = Invoke-Test "Recherche utilisateur AD" "" "" $samAccountName $searchBase
+        $resultsBox.AppendText("[Recherche utilisateur AD] Résultat immédiat :`r`n$result`r`n`r`n")
+    })
+
+    # --- Action : Lancer l'audit ---
+    $buttonRun.Add_Click({
+        $resultsBox.Clear()
+        $portValue = ""
+        $ipValue = ""
+        $samValue = ""
+        $searchBase = ""
+
+        # Récupération des valeurs des champs
+        foreach ($control in $form.Controls) {
+            switch ($control.Name) {
+                "txtPort" { $portValue = $control.Text }
+                "txtIP"   { $ipValue = $control.Text }
+                "txtSam"  { $samValue = $control.Text }
+                "txtDC"   { $searchBase = $control.Text }
+            }
+        }
+
+        # Liste des tests cochés
+        $testsCoches = @()
+        foreach ($kvp in $checkboxes.GetEnumerator()) {
+            if ($kvp.Value.Checked) {
+                $testsCoches += $kvp.Key
+            }
+        }
+
+        # Initialisation barre de progression
+        $progressBar.Value = 0
+        $totalTests = $testsCoches.Count
+        if ($totalTests -eq 0) {
+            $resultsBox.AppendText("Veuillez sélectionner au moins un test.`r`n")
+            return
+        }
+
+        # Lancement des tests un par un
+        for ($i = 0; $i -lt $totalTests; $i++) {
+            $testName = $testsCoches[$i]
+            $resultsBox.AppendText("[$testName] Test en cours...`r`n")
+            $result = Invoke-Test $testName $portValue $ipValue $samValue $searchBase
+            $resultsBox.AppendText($result + "`r`n`r`n")
+            $resultsBox.AppendText("[$testName] Test terminé.`r`n`r`n")
+
+            # Mise à jour ProgressBar
+            $progressBar.Value = [math]::Min(100, [math]::Round((($i + 1) / $totalTests) * 100))
+            $form.Refresh()
+        }
+    })
+
+    # Affiche le formulaire
+    $form.ShowDialog()
+}
+
+###############################################################
+###                 GESTION DES TESTS LOGIQUES              ###
+###############################################################
+
+function Invoke-Test($TestName, $PortToTest, $IPToTest, $SamAccount, $SearchBase) {
+    # La fonction prend en paramètre :
+    # - $TestName : nom du test à exécuter
+    # - $PortToTest : port à analyser (si requis)
+    # - $IPToTest : adresse IP à tester (ping)
+    # - $SamAccount : identifiant SAM pour la recherche AD
+    # - $SearchBase : base LDAP de recherche pour AD
+
+    switch ($TestName) {
+
+        # ----- Test de l'espace disque -----
+        "Espace disque" {
+            # Récupère les disques locaux (type 3) via WMI
+            $disks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3"
+            $out = ""
+            foreach ($disk in $disks) {
+                $freeGB = [math]::Round($disk.FreeSpace / 1GB,2)
+                $totalGB = [math]::Round($disk.Size / 1GB,2)
+                $out += "$($disk.DeviceID) : $freeGB GB libres sur $totalGB GB`r`n"
+            }
+            return $out
+        }
+
+        # ----- Test CPU / RAM -----
+        "Utilisation CPU / RAM" {
+            try {
+                # Moyenne de la charge CPU et RAM libre
+                $cpuLoad = Get-WmiObject -Class Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+                $ram = Get-WmiObject Win32_OperatingSystem
+                $ramFreeGB = [math]::Round($ram.FreePhysicalMemory / 1024 / 1024, 2)
+                return "CPU : $cpuLoad % utilisé`r`nRAM libre : $ramFreeGB GB"
+            } catch {
+                return "Impossible de récupérer les stats CPU/RAM"
+            }
+        }
+
+        # ----- Test de connectivité (ping IP) -----
+        "Connectivité réseau" {
+            # Vérifie si l'adresse IP est valide
+            if (-not [System.Net.IPAddress]::TryParse($IPToTest, [ref]$null)) {
+                return "Erreur : IP invalide ou non renseignée. Exemple valide : 8.8.8.8"
+            }
+
+            # Ping 2 fois l’adresse IP (mode silencieux)
+            $ping = Test-Connection -ComputerName $IPToTest -Count 2 -Quiet
+            if ($ping) {
+                return "Ping vers $IPToTest : OK"
+            } else {
+                return "Ping vers $IPToTest : Échec"
+            }
+        }
+
+        # ----- Vérification des mises à jour Windows disponibles -----
+        "Mises à jour Windows" {
+            try {
+                # Utilise les objets COM de Windows Update pour rechercher les MAJ non installées
+                $session = New-Object -ComObject Microsoft.Update.Session
+                $searcher = $session.CreateUpdateSearcher()
+                $result = $searcher.Search("IsInstalled=0 and Type='Software'")
+                if ($result.Updates.Count -eq 0) {
+                    return "Aucune mise à jour en attente."
+                } else {
+                    $out = "$($result.Updates.Count) mise(s) à jour en attente :`r`n"
+                    foreach ($update in $result.Updates) {
+                        $out += "- $($update.Title)`r`n"
+                    }
+                    return $out
+                }
+            } catch {
+                return "Impossible de récupérer les mises à jour (service désactivé ou COM indisponible)."
+            }
+        }
+
+        # ----- Vérifie si WSUS est configuré -----
+        "WSUS" {
+            $wsusKeyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+            $wsusServerValue = "WUServer"
+            $wsusStatus = ""
+
+            try {
+                # Vérifie l'existence de la clé WSUS et lit l'adresse configurée
+                if (Test-Path $wsusKeyPath) {
+                    $wsusServer = Get-ItemProperty -Path $wsusKeyPath -Name $wsusServerValue -ErrorAction SilentlyContinue
+                    if ($wsusServer -and $wsusServer.$wsusServerValue) {
+                        $wsusStatus = "Serveur WSUS configuré : $($wsusServer.$wsusServerValue)"
+                    } else {
+                        $wsusStatus = "Aucun serveur WSUS configuré dans la clé $wsusKeyPath"
+                    }
+                } else {
+                    $wsusStatus = "Clé WSUS inexistante dans le registre."
+                }
+            } catch {
+                $wsusStatus = "Erreur lors de la lecture du registre WSUS : $_"
+            }
+
+            return $wsusStatus
+        }
+
+        # ----- Récupère les 10 dernières erreurs système -----
+        "Logs systèmes" {
+            try {
+                $errors = Get-EventLog -LogName System -EntryType Error -Newest 10
+                return ($errors | ForEach-Object { "$($_.TimeGenerated) - $($_.Source): $($_.Message)" }) -join "`r`n"
+            } catch {
+                return "Impossible de récupérer les logs systèmes."
+            }
+        }
+
+        # ----- Vérifie si un port TCP est ouvert (via netstat) -----
+        "Test port et firewall" {
+            # Vérifie que le port est un entier valide
+            if (-not [int]::TryParse($PortToTest, [ref]$null) -or $PortToTest -lt 1 -or $PortToTest -gt 65535) {
+                return "Erreur : veuillez saisir un numéro de port valide entre 1 et 65535."
+            }
+            $port = [int]$PortToTest
+
+            # Recherche le port dans la liste des connexions actives
+            $netstatOutput = netstat -an | Select-String ":$port\s"
+            if ($netstatOutput) {
+                return "Port $port est ouvert et en écoute."
+            } else {
+                return "Port $port fermé ou non en écoute."
+            }
+        }
+
+        # ----- Recherche utilisateur dans Active Directory -----
+        "Recherche utilisateur AD" {
+            # Vérifie que les deux champs requis sont remplis
+            if ([string]::IsNullOrEmpty($SamAccount) -or [string]::IsNullOrEmpty($SearchBase)) {
+                return "Erreur : sAMAccountName et Base de recherche doivent être renseignés."
+            }
+            try {
+                # Charge le module Active Directory
+                Import-Module ActiveDirectory -ErrorAction Stop
+
+                # Recherche l'utilisateur correspondant au sAMAccountName
+                $user = Get-ADUser -Filter "sAMAccountName -eq '$SamAccount'" -SearchBase $SearchBase -Properties *
+                if ($null -eq $user) {
+                    return "Utilisateur '$SamAccount' non trouvé dans $SearchBase."
+                } else {
+                    return "Utilisateur trouvé : `r`nNom : $($user.Name)`r`nCompte : $($user.sAMAccountName)`r`nEmail : $($user.EmailAddress)"
+                }
+            } catch {
+                return "Erreur lors de la recherche AD : $_"
+            }
+        }
+
+        # ----- Par défaut : test inconnu -----
+        default {
+            return "Test inconnu : $TestName"
+        }
+    }
+}
+
+
+# --- Lancement de l'interface ---
+Show-VMHealthForm
