@@ -1,0 +1,1055 @@
+<#
+.SYNOPSIS
+    Outil tout-en-un de diagnostic pour machine virtuelle (VM) sous Windows.
+
+.DESCRIPTION
+    Ce script PowerShell avec interface graphique (WinForms) permet de réaliser rapidement
+    plusieurs tests de santé système sur une VM d'hébergement client :
+    - Vérification de l'espace disque
+    - État des services critiques
+    - Utilisation CPU et RAM
+    - Connectivité réseau via ping
+    - État de l'antivirus Windows Defender
+    - Vérification des mises à jour Windows en attente
+    - Analyse des derniers logs système (erreurs)
+
+    L’utilisateur peut sélectionner les tests à effectuer via une checklist,
+    lancer l’audit, et consulter les résultats dans une fenêtre dédiée.
+
+.AUTHOR
+    GGO - Administrateur Système
+
+.VERSION
+    1.0 - 2025-05-28 - Version initiale
+
+.NOTES
+    - Nécessite PowerShell exécuté avec droits administrateur pour certains tests.
+    - Utilise les composants COM Microsoft.Update.Session pour récupérer les mises à jour.
+    - Destiné à faciliter le diagnostic rapide sur les VM Windows hébergées.
+
+.EXAMPLE
+    .\Outil-Diagnostic-VM.ps1
+#>
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Dictionnaire des tests Disponibles.
+$TestsDisponibles = @(
+    "Espace disque",
+    "Utilisation CPU / RAM",
+    "Connectivité réseau",
+    "Test port et firewall",
+    "Mises à jour Windows",
+    "WSUS",
+    "Logs systèmes",
+    "Recherche utilisateur AD"
+)
+
+###############################################
+### Fonction de Gestion du Formulaire #########
+###############################################
+
+function Show-AdvancedFeaturesForm {
+
+    $formAdv = New-Object System.Windows.Forms.Form
+    $formAdv.Text = "Fonctionnalités avancées - Diagnostic approfondi"
+    $formAdv.Size = New-Object System.Drawing.Size(1000,800)
+    $formAdv.StartPosition = "CenterScreen"
+
+    $labelAdv = New-Object System.Windows.Forms.Label
+    $labelAdv.Text = "Sélectionnez les tests avancés à réaliser :"
+    $labelAdv.Location = New-Object System.Drawing.Point(20,20)
+    $labelAdv.AutoSize = $true
+    $formAdv.Controls.Add($labelAdv)
+
+   # Définition fiable des tests avec clés simples
+    $testsAdv = [ordered]@{
+    "sfc_dism"         = "Intégrité système (SFC / DISM)"
+    "boot_perf"        = "Temps démarrage services critiques"
+    "dns_latency"      = "Latence DNS / Résolution noms"
+    "drivers"          = "État des pilotes"
+    "ntp"              = "Synchronisation NTP"
+    "security_basics"  = "Validation des paramètres de sécurité de base"
+    "startup_programs" = "Recherche des programmes au démarrage"
+    "domain_controller"     = "Connexion au contrôleur de domaine (NLTest / DCDiag lite)"
+    "recent_boot"           = "Temps de démarrage récent (EventLog 6005/6006 ou Uptime)"
+    "certificates_check" =  "Verifier les certificats"
+    "temp_files_check" = "Vérifie les fichiers TEMP + orphelins sur la lettre choisie"
+    "device_errors"         = "Liste des périphériques en erreur (gestionnaire de périphériques)"
+    "failed_scheduled_tasks"= "Vérification des tâches planifiées en échec"
+    "bitlocker_status"      = "État de BitLocker (si applicable)"
+    "resource_usage"        = "Ressources bloquantes ou processus anormaux (CPU / RAM)"
+    "disk_usage_top"        = "Utilisation disque par fichiers lourds (top 10)"
+    "disk_permission_issues" = "Problèmes de droits sur les repertoires"
+    
+}
+
+$checkboxesAdv = @{}
+$yAdv = 50
+$textboxesAdv = @{}
+
+foreach ($key in $testsAdv.Keys) {
+    $cb = New-Object System.Windows.Forms.CheckBox
+    $cb.Text = $testsAdv[$key]
+    $cb.Location = New-Object System.Drawing.Point(40, $yAdv)
+    $cb.AutoSize = $true
+    $formAdv.Controls.Add($cb)  # <-- On ajoute qu'une fois ici
+
+    $checkboxesAdv[$key] = $cb 
+
+    if ($key -eq "dns_latency") {
+        # Ne PAS ajouter $cb une seconde fois ici (ligne supprimée)
+
+        $cb.Width = 200
+
+        $tb = New-Object System.Windows.Forms.TextBox
+        $tb.Size = New-Object System.Drawing.Size(200, 20)
+        $tb.Location = New-Object System.Drawing.Point(($cb.Location.X + $cb.Width + 10), $cb.Location.Y)
+        $tb.Text = "www.google.com"
+        $tb.Visible = $false
+        $formAdv.Controls.Add($tb)
+        $textboxesAdv[$key] = $tb
+
+        # Important: Capturer les variables pour l'event handler
+        $cb.Add_CheckedChanged({
+            param($sender, $args)
+            # Debug
+            Write-Host "Checkbox dns_latency checked = $($sender.Checked)"
+            $tb.Visible = $sender.Checked
+        })
+    }
+
+    $yAdv += 30
+}
+
+    # Menu déroulant pour sélectionner le disque à analyser
+    $labelDisk = New-Object System.Windows.Forms.Label
+    $labelDisk.Text = "Disque à analyser"
+    $labelDisk.Location = New-Object System.Drawing.Point(40, $yAdv)
+    $formAdv.Controls.Add($labelDisk)
+
+    $comboDisk = New-Object System.Windows.Forms.ComboBox
+    $comboDisk.Location = New-Object System.Drawing.Point(160, ($yAdv - 3))
+    $comboDisk.Size = New-Object System.Drawing.Size(240, 20)
+    $comboDisk.DropDownStyle = 'DropDownList'
+
+    # Préparer la liste des disques fixes avec taille libre / totale
+$fixedDrives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' }
+
+foreach ($drive in $fixedDrives) {
+    $freeGB = [math]::Round($drive.AvailableFreeSpace / 1GB, 2)
+    $totalGB = [math]::Round($drive.TotalSize / 1GB, 2)
+    $displayText = "$($drive.Name) - Libre : $freeGB GB / Total : $totalGB GB"
+    $comboDisk.Items.Add($displayText)
+}
+
+# Sélectionner le premier disque par défaut
+$comboDisk.SelectedIndex = 0
+
+$formAdv.Controls.Add($comboDisk)
+
+$yAdv += 30
+
+    # Zone résultats
+    $resultsBoxAdv = New-Object System.Windows.Forms.TextBox
+    $resultsBoxAdv.Multiline = $true
+    $resultsBoxAdv.ScrollBars = "Vertical"
+    $resultsBoxAdv.Location = New-Object System.Drawing.Point(500, 50)  # À droite des checkbox
+    $resultsBoxAdv.Size = New-Object System.Drawing.Size(420, 400)      # Haute mais pas jusqu'au bouton
+    $resultsBoxAdv.Font = New-Object System.Drawing.Font("Consolas", 10)
+    $formAdv.Controls.Add($resultsBoxAdv)
+
+    # Calcul de la position Y après les dernières checkbox
+    $baseY = $yAdv + 10  # $yAdv vaut ici 470, donc baseY = 480
+
+    # Bouton lancer tests avancés
+    $buttonRunAdv = New-Object System.Windows.Forms.Button
+    $buttonRunAdv.Text = "Lancer tests avancés"
+    $buttonRunAdv.Location = New-Object System.Drawing.Point(40, $baseY)
+    $buttonRunAdv.Size = New-Object System.Drawing.Size(150, 30)
+    $formAdv.Controls.Add($buttonRunAdv)
+
+    # ProgressBar en dessous du bouton (30 + 10 px plus bas)
+    $progressBarAdv = New-Object System.Windows.Forms.ProgressBar
+    $progressBarAdv.Size = New-Object System.Drawing.Size(310, 20)
+    $progressBarAdv.Location = New-Object System.Drawing.Point(40, ($baseY + 40))
+    $progressBarAdv.Minimum = 0
+    $progressBarAdv.Maximum = 100
+    $progressBarAdv.Value = 0
+    $formAdv.Controls.Add($progressBarAdv)
+
+    # Fonction interne d'exécution des tests avancés
+    function Invoke-AdvancedTest {
+    param(
+        [string]$testKey,
+        [string]$driveLetter = $null,
+        [string]$dnsHost = $null   # <-- nouveau paramètre pour dns_latency
+    )
+
+    switch ($testKey) {
+        "certificates_check" {
+    $out = "🔐 Vérification des certificats numériques installés...`r`n`r`n"
+    try {
+        $stores = @("Cert:\LocalMachine\My", "Cert:\CurrentUser\My")
+        foreach ($store in $stores) {
+            $out += "Magasin : $store`r`n"
+            $certs = Get-ChildItem -Path $store -ErrorAction SilentlyContinue
+            if ($certs) {
+                foreach ($cert in $certs) {
+                    $subject = $cert.Subject
+                    $issuer = $cert.Issuer
+                    $expiry = $cert.NotAfter
+                    $now = Get-Date
+                    $validity = if ($expiry -gt $now) { "Valide" } else { "Expiré" }
+                    $daysLeft = ($expiry - $now).Days
+                    $out += " - Sujet : $subject`r`n   Émetteur : $issuer`r`n   Expire le : $expiry ($validity, Jours restants : $daysLeft)`r`n`r`n"
+                }
+            } else {
+                $out += "Aucun certificat trouvé dans ce magasin.`r`n"
+            }
+        }
+    }
+    catch {
+        $out += "❌ Erreur lors de la récupération des certificats : $_`r`n"
+    }
+    return $out
+}
+"temp_files_check" {
+    if (-not $driveLetter) {
+        return "❌ Aucun disque spécifié pour la recherche de fichiers temporaires."
+    }
+
+    $out = "🗂️ Recherche de fichiers temporaires volumineux (>100MB) sur $driveLetter ...`r`n`r`n"
+    try {
+        $tempPaths = @(
+            Join-Path $driveLetter "Windows\Temp"
+        )
+
+        # Pour le chemin avec wildcard, on va le gérer à part, car Join-Path ne supporte pas le '*'
+        $userTempPathPattern = Join-Path $driveLetter "Users"
+        $userTempPaths = Get-ChildItem -Path $userTempPathPattern -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            Join-Path $_.FullName "AppData\Local\Temp"
+        }
+        $tempPaths += $userTempPaths
+
+        # Ajouter ProgramData\Temp aussi
+        $tempPaths += Join-Path $driveLetter "ProgramData\Temp"
+
+        $bigTempFiles = @()
+
+        foreach ($path in $tempPaths) {
+            if (Test-Path $path) {
+                $files = Get-ChildItem -Path $path -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 100MB }
+                $bigTempFiles += $files
+            }
+        }
+
+        if ($bigTempFiles.Count -eq 0) {
+            $out += "✅ Aucun fichier temporaire volumineux détecté.`r`n"
+        } else {
+            $topFiles = $bigTempFiles | Sort-Object Length -Descending | Select-Object -First 20
+            $counter = 1
+            foreach ($file in $topFiles) {
+                $sizeMB = [math]::Round($file.Length / 1MB, 2)
+                $out += " $counter. $($file.FullName) — $sizeMB MB`r`n"
+                $counter++
+            }
+        }
+    }
+    catch {
+        $out += "❌ Erreur lors de la recherche de fichiers temporaires : $_`r`n"
+    }
+    return $out
+}
+
+        "sfc_dism" {
+            $out = "Lancement de sfc /scannow (cela peut prendre plusieurs minutes)...`r`n"
+            try {
+                $proc = Start-Process -FilePath "sfc.exe" -ArgumentList "/scannow" -NoNewWindow -Wait -PassThru
+                $out += "sfc /scannow terminé avec le code de sortie : $($proc.ExitCode)`r`n"
+                $dism = Start-Process -FilePath "dism.exe" -ArgumentList "/Online /Cleanup-Image /CheckHealth" -NoNewWindow -Wait -PassThru
+                $out += "DISM /CheckHealth terminé avec le code de sortie : $($dism.ExitCode)`r`n"
+            } catch {
+                $out += "Erreur lors de l'exécution de sfc ou DISM : $_"
+            }
+            return $out
+        }
+        "boot_perf" {
+            $out = "Analyse du temps de démarrage des services critiques...`r`n"
+            # Exemple simple : récupérer les événements 6005 et 6006 dans le journal système
+            try {
+                $evt6005 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005} -MaxEvents 1 | Select-Object -ExpandProperty TimeCreated
+                $evt6006 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=6006} -MaxEvents 1 | Select-Object -ExpandProperty TimeCreated
+                $out += "Dernier événement 6005 (démarrage du service journal): $evt6005`r`n"
+                $out += "Dernier événement 6006 (arrêt du service journal) : $evt6006`r`n"
+            } catch {
+                $out += "Erreur lors de la lecture des événements système : $_"
+            }
+            return $out
+        }
+        "dns_latency" {
+            $domainToResolve = if ($dnsHost) { $dnsHost } else { "www.google.com" }
+            $out = "Test de latence DNS (résolution de $domainToResolve)...`r`n"
+            try {
+                $start = Get-Date
+                Resolve-DnsName $domainToResolve | Out-Null
+                $duration = (Get-Date) - $start
+                $out += "Résolution DNS terminée en $([math]::Round($duration.TotalMilliseconds,2)) ms.`r`n"
+            } catch {
+                $out += "Erreur lors de la résolution DNS : $_"
+            }
+            return $out
+        }
+        "drivers" {
+            $out = "Vérification de l’état des pilotes...`r`n"
+            try {
+                $driversWithErrors = Get-WmiObject Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 0 }
+                if ($driversWithErrors) {
+                    foreach ($drv in $driversWithErrors) {
+                        $out += "Pilote en erreur : $($drv.Name) - Code erreur : $($drv.ConfigManagerErrorCode)`r`n"
+                    }
+                } else {
+                    $out += "Aucun pilote avec erreur détecté.`r`n"
+                }
+            } catch {
+                $out += "Erreur lors de la vérification des pilotes : $_"
+            }
+            return $out
+        }
+        "disk_latency" {
+            $out = "Analyse d'utilisation disque (top 10 fichiers les plus lourds)...`r`n"
+            try {
+                $topFiles = Get-ChildItem -Path C:\ -Recurse -ErrorAction SilentlyContinue | 
+                    Where-Object { -not $_.PSIsContainer } | 
+                    Sort-Object Length -Descending | Select-Object -First 10 FullName, Length
+                foreach ($file in $topFiles) {
+                    $sizeMB = [math]::Round($file.Length / 1MB, 2)
+                    $out += "$($file.FullName) - $sizeMB MB`r`n"
+                }
+            } catch {
+                $out += "Erreur lors de l'analyse disque : $_"
+            }
+            return $out
+        }
+        "ntp" {
+            $out = "Vérification de la synchronisation NTP...`r`n"
+            try {
+                $w32Time = Get-Service w32time -ErrorAction Stop
+                $out += "Service Windows Time est : $($w32Time.Status)`r`n"
+                $ntpStatus = w32tm /query /status 2>&1
+                $out += $ntpStatus -join "`r`n"
+            } catch {
+                $out += "Erreur lors de la vérification NTP : $_"
+            }
+            return $out
+        }
+        "security_basics" {
+            $out = "Contrôle des paramètres de sécurité de base...`r`n"
+            try {
+                # Comptes admin désactivés
+                $disabledAdmins = Get-LocalGroupMember -Group "Administrateurs" | Where-Object {
+                    $user = $_.Name
+                    $acc = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+                    $acc -and $acc.Enabled -eq $false
+                }
+                if ($disabledAdmins) {
+                    $out += "Comptes admin désactivés : " + ($disabledAdmins.Name -join ", ") + "`r`n"
+                } else {
+                    $out += "Aucun compte admin désactivé détecté.`r`n"
+                }
+                # UAC activé ?
+                $uacValue = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -ErrorAction SilentlyContinue
+                if ($uacValue.EnableLUA -eq 1) {
+                    $out += "UAC est activé.`r`n"
+                } else {
+                    $out += "UAC est désactivé !`r`n"
+                }
+            } catch {
+                $out += "Erreur lors de la vérification des paramètres de sécurité : $_"
+            }
+            return $out
+        }
+        "startup_programs" {
+            $out = "Recherche des programmes au démarrage...`r`n"
+            try {
+                $startupItems = Get-CimInstance -ClassName Win32_StartupCommand
+                foreach ($item in $startupItems) {
+                    $out += "Nom: $($item.Name)`r`n"
+                }
+            } catch {
+                $out += "Erreur lors de la recherche des programmes au démarrage : $_"
+            }
+            return $out
+        }
+        "domain_controller" {
+            $out = "Vérification connexion au contrôleur de domaine...`r`n"
+            try {
+                $domain = (Get-WmiObject Win32_ComputerSystem).Domain
+                $out += "Domaine de la machine : $domain`r`n"
+                $nltest = nltest /dsgetdc:$domain 2>&1
+                $out += $nltest -join "`r`n"
+            } catch {
+                $out += "Erreur lors de la vérification du contrôleur de domaine : $_"
+            }
+            return $out
+        }
+        "recent_boot" {
+            $out = "Consultation du temps de démarrage récent...`r`n"
+            try {
+                $lastBoot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+                $uptime = (Get-Date) - $lastBoot
+                $out += "Dernier démarrage : $lastBoot`r`n"
+                $out += "Uptime : $([math]::Round($uptime.TotalHours,2)) heures`r`n"
+            } catch {
+                $out += "Erreur lors de la lecture du temps de démarrage : $_"
+            }
+            return $out
+        }
+        "device_errors" {
+            $out = "Liste des périphériques en erreur...`r`n"
+            try {
+                $devicesErr = Get-WmiObject Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 0 }
+                if ($devicesErr) {
+                    foreach ($dev in $devicesErr) {
+                        $out += "Périphérique : $($dev.Name), Code erreur : $($dev.ConfigManagerErrorCode)`r`n"
+                    }
+                } else {
+                    $out += "Aucun périphérique en erreur détecté.`r`n"
+                }
+            } catch {
+                $out += "Erreur lors de la récupération des périphériques : $_"
+            }
+            return $out
+        }
+        "failed_scheduled_tasks" {
+            $out = "Vérification des tâches planifiées désactivées ou en échec...`r`n"
+            try {
+                $tasks = Get-ScheduledTask | Where-Object { $_.State -eq 'Disabled' -or $_.State -eq 'Failed' }
+                if ($tasks) {
+                    foreach ($t in $tasks) {
+                        $out += "Tâche: $($t.TaskName), État: $($t.State)`r`n"
+                    }
+                } else {
+                    $out += "Aucune tâche planifiée désactivée ou en échec.`r`n"
+                }
+            } catch {
+                $out += "Erreur lors de la récupération des tâches planifiées : $_"
+            }
+            return $out
+        }
+
+        "bitlocker_status" {
+            $out = "État de BitLocker...`r`n"
+            try {
+                $volumes = Get-BitLockerVolume
+                foreach ($vol in $volumes) {
+                    $out += "Volume: $($vol.MountPoint), Statut: $($vol.VolumeStatus)`r`n"
+                }
+            } catch {
+                $out += "Erreur lors de la récupération de l'état BitLocker : $_"
+            }
+            return $out
+        }
+
+        "resource_usage" {
+    $out = "⚙️ Ressources bloquantes / processus gourmands...`r`n"
+    try {
+        $topCPU = Get-Process | Where-Object { $_.CPU -ne $null } |
+                  Sort-Object CPU -Descending | Select-Object -First 5 -Property Id, ProcessName, CPU, WorkingSet
+
+        foreach ($proc in $topCPU) {
+            $cpu = [math]::Round($proc.CPU, 2)
+            $memMB = [math]::Round($proc.WorkingSet / 1MB, 2)
+            $out += " - $($proc.ProcessName) (PID: $($proc.Id)) CPU: $cpu sec, RAM: $memMB MB`r`n"
+        }
+    }
+    catch {
+        $out += "Erreur lors de la récupération des processus gourmands : $_`r`n"
+    }
+    return $out
+}
+
+ "disk_usage_top" {
+    if (-not $driveLetter) {
+        return "❌ Aucun disque spécifié pour le test d'utilisation disque."
+    }
+
+    $out = "📁 Top 10 des fichiers les plus lourds sur $driveLetter :`r`n`r`n"
+    $files = @()
+
+    # Fonction récursive sécurisée pour récupérer fichiers avec gestion d'erreurs
+    function Get-FilesSafely($path) {
+        $collectedFiles = @()
+        try {
+            # Récupérer les fichiers dans ce dossier
+            $collectedFiles += Get-ChildItem -Path $path -File -ErrorAction Stop
+
+            # Récupérer les sous-dossiers pour descendre récursivement
+            $subdirs = Get-ChildItem -Path $path -Directory -ErrorAction Stop
+            foreach ($subdir in $subdirs) {
+                $collectedFiles += Get-FilesSafely -path $subdir.FullName
+            }
+        }
+        catch {
+            # Ignorer les erreurs d'accès et continuer
+        }
+        return $collectedFiles
+    }
+
+    try {
+        if ($driveLetter -eq "C:\") {
+            $safeFolders = @("C:\Users", "C:\ProgramData", "C:\Temp")
+            foreach ($folder in $safeFolders) {
+                if (Test-Path $folder) {
+                    $files += Get-FilesSafely -path $folder
+                }
+            }
+        }
+        else {
+            if (Test-Path $driveLetter) {
+                $files += Get-FilesSafely -path $driveLetter
+            }
+            else {
+                return "⚠️ Le disque $driveLetter n'existe pas ou n'est pas accessible.`r`n"
+            }
+        }
+
+        if ($files.Count -eq 0) {
+            $out += "ℹ️ Aucun fichier trouvé sur le disque $driveLetter.`r`n"
+        }
+        else {
+            $topFiles = $files | Sort-Object Length -Descending | Select-Object -First 10
+            $counter = 1
+            foreach ($file in $topFiles) {
+                $sizeMB = [math]::Round($file.Length / 1MB, 2)
+                $out += " $counter. $($file.FullName) — $sizeMB MB`r`n"
+                $counter++
+            }
+        }
+    }
+    catch {
+        $out += "❌ Erreur lors de la récupération des fichiers lourds : $_`r`n"
+    }
+
+    return $out
+}
+"disk_permission_issues" {
+    param (
+        [string]$driveLetter
+    )
+
+    if (-not $driveLetter) {
+        return "❌ Aucun disque spécifié pour le test des permissions de création."
+    }
+
+    $out = "🔍 Vérification des dossiers où la création nécessite une élévation sur $driveLetter ...`r`n`r`n"
+
+    try {
+        if (-not (Test-Path $driveLetter)) {
+            return "⚠️ Le disque $driveLetter n'existe pas ou n'est pas accessible.`r`n"
+        }
+
+        # Lister les dossiers à la racine du disque
+        $rootFolders = Get-ChildItem -Path $driveLetter -Directory -ErrorAction Stop
+        $protectedFolders = @()
+
+        foreach ($folder in $rootFolders) {
+            $testDirName = "TestCreateDir_$([guid]::NewGuid().ToString())"
+            $testDirPath = Join-Path -Path $folder.FullName -ChildPath $testDirName
+
+            try {
+                # Tenter de créer un dossier test
+                New-Item -Path $testDirPath -ItemType Directory -ErrorAction Stop | Out-Null
+
+                # Si création réussie, supprimer le dossier test
+                Remove-Item -Path $testDirPath -Force -Recurse -ErrorAction SilentlyContinue
+            }
+            catch {
+                # Si erreur (probablement accès refusé), ajouter dossier à la liste
+                $protectedFolders += $folder.FullName
+            }
+        }
+
+        if ($protectedFolders.Count -eq 0) {
+            $out += "✅ Aucun dossier ne nécessite d'élévation pour créer un dossier à la racine de $driveLetter.`r`n"
+        }
+        else {
+            $out += "⚠️ Dossiers nécessitant une élévation pour créer un dossier :`r`n"
+            foreach ($p in $protectedFolders) {
+                $out += " - $p`r`n"
+            }
+        }
+    }
+    catch {
+        $out += "❌ Erreur lors du test de création des dossiers : $_`r`n"
+    }
+
+    return $out
+}
+        default {
+            return "Test inconnu : $testKey"
+        }
+    }
+}
+
+    # Action bouton lancer tests avancés
+    $buttonRunAdv.Add_Click({
+    $resultsBoxAdv.Clear()
+    $progressBarAdv.Value = 0
+    
+    # Debug affichage checkboxes cochées
+    foreach ($key in $checkboxesAdv.Keys) {
+        Write-Host "Checkbox $key Checked = $($checkboxesAdv[$key].Checked)"
+    }
+
+    $testsChecked = $checkboxesAdv.GetEnumerator() | Where-Object { $_.Value.Checked } | ForEach-Object { $_.Key }
+    $total = $testsChecked.Count
+
+    if ($total -eq 0) {
+        $resultsBoxAdv.AppendText("Veuillez sélectionner au moins un test avancé.`r`n")
+        return
+    }
+
+    $i = 0
+    foreach ($testKey in $testsChecked) {
+        $label = $testsAdv[$testKey]
+        $resultsBoxAdv.AppendText("[$label] Test en cours...`r`n")
+
+        switch ($testKey) {
+            "dns_latency" {
+                $dnsHost = $null
+                if ($textboxesAdv.ContainsKey($testKey)) {
+                    $dnsHost = $textboxesAdv[$testKey].Text.Trim()
+                }
+                if ([string]::IsNullOrWhiteSpace($dnsHost)) {
+                    [System.Windows.Forms.MessageBox]::Show("Veuillez remplir le champ Domaine pour le test DNS.", "Erreur", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                    return
+                }
+                $res = Invoke-AdvancedTest -testKey $testKey -dnsHost $dnsHost
+            }
+            "disk_usage_top" {
+        # Récupérer la lettre du disque sélectionnée dans la combobox
+        $driveLetter = $comboDisk.SelectedItem
+        if (-not $driveLetter) {
+            [System.Windows.Forms.MessageBox]::Show("Veuillez sélectionner un disque pour le test d'utilisation disque.", "Erreur", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+        $res = Invoke-AdvancedTest -testKey $testKey -driveLetter $driveLetter
+    }
+            "disk_permission_issues" {
+            $driveLetter = $comboDisk.SelectedItem
+            if (-not $driveLetter) {
+                [System.Windows.Forms.MessageBox]::Show("Veuillez sélectionner un disque pour le test des permissions de création.", "Erreur", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+            $res = Invoke-AdvancedTest -testKey $testKey -driveLetter $driveLetter
+        }
+        "temp_files_check" {
+            $driveLetter = $comboDisk.SelectedItem
+            if (-not $driveLetter) {
+                [System.Windows.Forms.MessageBox]::Show("Veuillez sélectionner un disque pour la recherche de fichiers temporaires.", "Erreur", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+            $res = Invoke-AdvancedTest -testKey $testKey -driveLetter $driveLetter
+        }
+        default {
+            $res = Invoke-AdvancedTest -testKey $testKey
+        }
+    }
+         
+        $resultsBoxAdv.AppendText($res + "`r`n")
+        $resultsBoxAdv.AppendText("[$label] Test terminé.`r`n`r`n")
+
+        $i++
+        $progressBarAdv.Value = [math]::Min(100, [math]::Round(($i / $total) * 100))
+        $formAdv.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    $progressBarAdv.Value = 100
+})
+
+    $formAdv.ShowDialog()
+}
+
+
+function Show-VMHealthForm {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Diagnostic VM - Outil tout-en-un"
+    $form.Size = New-Object System.Drawing.Size(600,750)
+    $form.StartPosition = "CenterScreen"
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Sélectionnez les tests à effectuer :"
+    $label.Location = New-Object System.Drawing.Point(20,20)
+    $label.AutoSize = $true
+    $form.Controls.Add($label)
+
+    $checkboxes = @{}
+    $y = 50
+
+    # Création des checkboxes et champs spécifiques
+    foreach ($test in $TestsDisponibles) {
+        $cb = New-Object System.Windows.Forms.CheckBox
+        $cb.Text = $test
+        $cb.Location = New-Object System.Drawing.Point(40, $y)
+        $cb.AutoSize = $true
+        $form.Controls.Add($cb)
+        $checkboxes[$test] = $cb
+
+        # TextBox IP pour Connectivité réseau - initialement cachés
+        if ($test -eq "Connectivité réseau") {
+            $txtIP = New-Object System.Windows.Forms.TextBox
+            $txtIP.Name = "txtIP"
+            $txtIP.Size = New-Object System.Drawing.Size(120, 20)
+            $txtIP.Location = New-Object System.Drawing.Point(200, $y)
+            $txtIP.Text = "127.0.0.1"
+            $txtIP.Visible = $false
+            $form.Controls.Add($txtIP)
+
+            $lblIP = New-Object System.Windows.Forms.Label
+            $lblIP.Text = "IP Destination"
+            $lblIP.Location = New-Object System.Drawing.Point(330, ($y + 3))
+            $lblIP.AutoSize = $true
+            $lblIP.Visible = $false
+            $form.Controls.Add($lblIP)
+        }
+
+        # TextBox Port pour Test port et firewall - initialement cachés
+        if ($test -eq "Test port et firewall") {
+            $txtPort = New-Object System.Windows.Forms.TextBox
+            $txtPort.Name = "txtPort"
+            $txtPort.Size = New-Object System.Drawing.Size(60, 20)
+            $txtPort.Location = New-Object System.Drawing.Point(200, $y)
+            $txtPort.Text = ""
+            $txtPort.Visible = $false
+            $form.Controls.Add($txtPort)
+
+            $lblPort = New-Object System.Windows.Forms.Label
+            $lblPort.Text = "Port à tester"
+            $lblPort.Location = New-Object System.Drawing.Point(270, ($y + 3))
+            $lblPort.AutoSize = $true
+            $lblPort.Visible = $false
+            $form.Controls.Add($lblPort)
+        }
+
+        $y += 30
+    }
+
+    # Champs pour Recherche utilisateur AD (masqués)
+    $txtSam = New-Object System.Windows.Forms.TextBox
+    $txtSam.Name = "txtSam"
+    $txtSam.Size = New-Object System.Drawing.Size(150, 20)
+    $txtSam.Location = New-Object System.Drawing.Point(250, (50 + (30 * ($TestsDisponibles.IndexOf("Recherche utilisateur AD")))))
+    $txtSam.Visible = $false
+    $form.Controls.Add($txtSam)
+
+    $lblSam = New-Object System.Windows.Forms.Label
+    $lblSam.Text = "sAMAccountName"
+    $lblSam.Location = New-Object System.Drawing.Point(410, (53 + (30 * ($TestsDisponibles.IndexOf("Recherche utilisateur AD")))))
+    $lblSam.AutoSize = $true
+    $lblSam.Visible = $false
+    $form.Controls.Add($lblSam)
+
+    $txtDC = New-Object System.Windows.Forms.TextBox
+    $txtDC.Name = "txtDC"
+    $txtDC.Size = New-Object System.Drawing.Size(120, 20)
+    $txtDC.Location = New-Object System.Drawing.Point(250, (50 + (30 * ($TestsDisponibles.IndexOf("Recherche utilisateur AD"))) + 30))
+    $txtDC.Text = "DC=mondomaine,DC=local"
+    $txtDC.Visible = $false
+    $form.Controls.Add($txtDC)
+
+    $lblDC = New-Object System.Windows.Forms.Label
+    $lblDC.Text = "Base de recherche (DC)"
+    $lblDC.Location = New-Object System.Drawing.Point(380, (83 + (30 * ($TestsDisponibles.IndexOf("Recherche utilisateur AD")))))
+    $lblDC.AutoSize = $true
+    $lblDC.Visible = $false
+    $form.Controls.Add($lblDC)
+
+    # Bouton Rechercher utilisateur AD
+    $btnSearchUser = New-Object System.Windows.Forms.Button
+    $btnSearchUser.Text = "Rechercher utilisateur"
+    $btnSearchUser.Location = New-Object System.Drawing.Point(250, (50 + (30 * ($TestsDisponibles.IndexOf("Recherche utilisateur AD"))) + 60))
+    $btnSearchUser.Size = New-Object System.Drawing.Size(150,25)
+    $btnSearchUser.Visible = $false
+    $form.Controls.Add($btnSearchUser)
+
+    # Bouton Lancer l'audit
+    $buttonRun = New-Object System.Windows.Forms.Button
+    $buttonRun.Text = "Lancer l'audit"
+    $buttonRun.Location = New-Object System.Drawing.Point(40, ($y + 10))
+    $buttonRun.Size = New-Object System.Drawing.Size(100,30)
+    $form.Controls.Add($buttonRun)
+
+    # Bouton Fonctionnalités avancées
+    $buttonAdvanced = New-Object System.Windows.Forms.Button
+    $buttonAdvanced.Text = "Fonctionnalités avancées"
+    $buttonAdvanced.Size = New-Object System.Drawing.Size(150, 30)
+    $buttonAdvanced.Location = New-Object System.Drawing.Point(($form.ClientSize.Width - 170), 15)
+    $buttonAdvanced.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $form.Controls.Add($buttonAdvanced)
+
+    # Action du bouton : ouvrir la fenêtre avancée
+    $buttonAdvanced.Add_Click({
+        Show-AdvancedFeaturesForm
+    })
+
+    # Boîte de dialogue des Résultats
+    $resultsBox = New-Object System.Windows.Forms.TextBox
+    $resultsBox.Multiline = $true
+    $resultsBox.ScrollBars = "Vertical"
+    $resultsBox.Size = New-Object System.Drawing.Size(520,300)
+    $resultsBox.Location = New-Object System.Drawing.Point(40, ($y + 60))
+    $resultsBox.Font = New-Object System.Drawing.Font("Consolas",10)
+    $form.Controls.Add($resultsBox)
+
+    # --- Ajout de la barre de progression ---
+    $progressBar = New-Object System.Windows.Forms.ProgressBar
+    $progressBar.Size = New-Object System.Drawing.Size(520, 20)
+    $progressBar.Location = New-Object System.Drawing.Point(40, ($y + 370))
+    $progressBar.Minimum = 0
+    $progressBar.Maximum = 100
+    $progressBar.Value = 0
+    $form.Controls.Add($progressBar)
+
+    # Gestion dynamique de l'affichage des champs sAMAccountName et DC selon état de la checkbox "Recherche utilisateur AD"
+    $checkboxes["Recherche utilisateur AD"].Add_CheckedChanged({
+        $checked = $checkboxes["Recherche utilisateur AD"].Checked
+        $txtSam.Visible = $checked
+        $lblSam.Visible = $checked
+        $txtDC.Visible = $checked
+        $lblDC.Visible = $checked
+        $btnSearchUser.Visible = $checked
+    })
+
+    # Gestion dynamique pour Connectivité réseau (affiche/masque IP + label)
+    $checkboxes["Connectivité réseau"].Add_CheckedChanged({
+        $checked = $checkboxes["Connectivité réseau"].Checked
+        $txtIP.Visible = $checked
+        $lblIP.Visible = $checked
+    })
+
+    # Gestion dynamique pour Test port et firewall (affiche/masque Port + label)
+    $checkboxes["Test port et firewall"].Add_CheckedChanged({
+        $checked = $checkboxes["Test port et firewall"].Checked
+        $txtPort.Visible = $checked
+        $lblPort.Visible = $checked
+    })
+
+    # Action bouton Rechercher utilisateur AD
+    $btnSearchUser.Add_Click({
+        $samAccountName = $txtSam.Text
+        $searchBase = $txtDC.Text
+        $result = Invoke-Test "Recherche utilisateur AD" "" "" $samAccountName $searchBase
+        $resultsBox.AppendText("[Recherche utilisateur AD] Résultat immédiat :" + [Environment]::NewLine)
+        $resultsBox.AppendText($result + [Environment]::NewLine + [Environment]::NewLine)
+    })
+
+    # Action bouton Lancer l'audit avec mise à jour dynamique de la ProgressBar
+        $buttonRun.Add_Click({
+        $resultsBox.Clear()
+        $portValue = ""
+        $ipValue = ""
+        $samValue = ""
+        $searchBase = ""
+
+        foreach ($control in $form.Controls) {
+            switch ($control.Name) {
+                "txtPort" { $portValue = $control.Text }
+                "txtIP"   { $ipValue = $control.Text }
+                "txtSam"  { $samValue = $control.Text }
+                "txtDC"   { $searchBase = $control.Text }
+            }
+        }
+
+        $testsCoches = @()
+        foreach ($kvp in $checkboxes.GetEnumerator()) {
+            if ($kvp.Value.Checked) {
+                $testsCoches += $kvp.Key
+            }
+        }
+
+        # Initialiser la ProgressBar
+        $progressBar.Value = 0
+        $totalTests = $testsCoches.Count
+        if ($totalTests -eq 0) {
+            $resultsBox.AppendText("Veuillez sélectionner au moins un test." + [Environment]::NewLine)
+            return
+        }
+
+        for ($i = 0; $i -lt $totalTests; $i++) {
+            $testName = $testsCoches[$i]
+            $resultsBox.AppendText("[$testName] Test en cours..." + [Environment]::NewLine)
+            $result = Invoke-Test $testName $portValue $ipValue $samValue $searchBase
+            $resultsBox.AppendText($result + [Environment]::NewLine + [Environment]::NewLine)
+            $resultsBox.AppendText("[$testName] Test terminé." + [Environment]::NewLine + [Environment]::NewLine)
+
+            # Mise à jour ProgressBar
+            $progressBar.Value = [math]::Min(100, [math]::Round((($i + 1) / $totalTests) * 100))
+            $form.Refresh()
+        }
+    })
+
+    $form.ShowDialog()
+}
+
+###############################################
+### Fonction de Gestion des tests #############
+###############################################
+function Invoke-Test($TestName, $PortToTest, $IPToTest, $SamAccount, $SearchBase) {
+    # La fonction prend en paramètre :
+    # - $TestName : nom du test à exécuter
+    # - $PortToTest : port à analyser (si requis)
+    # - $IPToTest : adresse IP à tester (ping)
+    # - $SamAccount : identifiant SAM pour la recherche AD
+    # - $SearchBase : base LDAP de recherche pour AD
+
+    switch ($TestName) {
+
+        # ----- Test de l'espace disque -----
+        "Espace disque" {
+            # Récupère les disques locaux (type 3) via WMI
+            $disks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3"
+            $out = ""
+            foreach ($disk in $disks) {
+                $freeGB = [math]::Round($disk.FreeSpace / 1GB,2)
+                $totalGB = [math]::Round($disk.Size / 1GB,2)
+                $out += "$($disk.DeviceID) : $freeGB GB libres sur $totalGB GB`r`n"
+            }
+            return $out
+        }
+
+        # ----- Test CPU / RAM -----
+        "Utilisation CPU / RAM" {
+            try {
+                # Moyenne de la charge CPU et RAM libre
+                $cpuLoad = Get-WmiObject -Class Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+                $ram = Get-WmiObject Win32_OperatingSystem
+                $ramFreeGB = [math]::Round($ram.FreePhysicalMemory / 1024 / 1024, 2)
+                return "CPU : $cpuLoad % utilisé`r`nRAM libre : $ramFreeGB GB"
+            } catch {
+                return "Impossible de récupérer les stats CPU/RAM"
+            }
+        }
+
+        # ----- Test de connectivité (ping IP) -----
+        "Connectivité réseau" {
+            # Vérifie si l'adresse IP est valide
+            if (-not [System.Net.IPAddress]::TryParse($IPToTest, [ref]$null)) {
+                return "Erreur : IP invalide ou non renseignée. Exemple valide : 8.8.8.8"
+            }
+
+            # Ping 2 fois l’adresse IP (mode silencieux)
+            $ping = Test-Connection -ComputerName $IPToTest -Count 2 -Quiet
+            if ($ping) {
+                return "Ping vers $IPToTest : OK"
+            } else {
+                return "Ping vers $IPToTest : Échec"
+            }
+        }
+
+        # ----- Vérification des mises à jour Windows disponibles -----
+        "Mises à jour Windows" {
+            try {
+                # Utilise les objets COM de Windows Update pour rechercher les MAJ non installées
+                $session = New-Object -ComObject Microsoft.Update.Session
+                $searcher = $session.CreateUpdateSearcher()
+                $result = $searcher.Search("IsInstalled=0 and Type='Software'")
+                if ($result.Updates.Count -eq 0) {
+                    return "Aucune mise à jour en attente."
+                } else {
+                    $out = "$($result.Updates.Count) mise(s) à jour en attente :`r`n"
+                    foreach ($update in $result.Updates) {
+                        $out += "- $($update.Title)`r`n"
+                    }
+                    return $out
+                }
+            } catch {
+                return "Impossible de récupérer les mises à jour (service désactivé ou COM indisponible)."
+            }
+        }
+
+        # ----- Vérifie si WSUS est configuré -----
+        "WSUS" {
+            $wsusKeyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+            $wsusServerValue = "WUServer"
+            $wsusStatus = ""
+
+            try {
+                # Vérifie l'existence de la clé WSUS et lit l'adresse configurée
+                if (Test-Path $wsusKeyPath) {
+                    $wsusServer = Get-ItemProperty -Path $wsusKeyPath -Name $wsusServerValue -ErrorAction SilentlyContinue
+                    if ($wsusServer -and $wsusServer.$wsusServerValue) {
+                        $wsusStatus = "Serveur WSUS configuré : $($wsusServer.$wsusServerValue)"
+                    } else {
+                        $wsusStatus = "Aucun serveur WSUS configuré dans la clé $wsusKeyPath"
+                    }
+                } else {
+                    $wsusStatus = "Clé WSUS inexistante dans le registre."
+                }
+            } catch {
+                $wsusStatus = "Erreur lors de la lecture du registre WSUS : $_"
+            }
+
+            return $wsusStatus
+        }
+
+        # ----- Récupère les 10 dernières erreurs système -----
+        "Logs systèmes" {
+            try {
+                $errors = Get-EventLog -LogName System -EntryType Error -Newest 10
+                return ($errors | ForEach-Object { "$($_.TimeGenerated) - $($_.Source): $($_.Message)" }) -join "`r`n"
+            } catch {
+                return "Impossible de récupérer les logs systèmes."
+            }
+        }
+
+        # ----- Vérifie si un port TCP est ouvert (via netstat) -----
+        "Test port et firewall" {
+            # Vérifie que le port est un entier valide
+            if (-not [int]::TryParse($PortToTest, [ref]$null) -or $PortToTest -lt 1 -or $PortToTest -gt 65535) {
+                return "Erreur : veuillez saisir un numéro de port valide entre 1 et 65535."
+            }
+            $port = [int]$PortToTest
+
+            # Recherche le port dans la liste des connexions actives
+            $netstatOutput = netstat -an | Select-String ":$port\s"
+            if ($netstatOutput) {
+                return "Port $port est ouvert et en écoute."
+            } else {
+                return "Port $port fermé ou non en écoute."
+            }
+        }
+
+        # ----- Recherche utilisateur dans Active Directory -----
+        "Recherche utilisateur AD" {
+            # Vérifie que les deux champs requis sont remplis
+            if ([string]::IsNullOrEmpty($SamAccount) -or [string]::IsNullOrEmpty($SearchBase)) {
+                return "Erreur : sAMAccountName et Base de recherche doivent être renseignés."
+            }
+            try {
+                # Charge le module Active Directory
+                Import-Module ActiveDirectory -ErrorAction Stop
+
+                # Recherche l'utilisateur correspondant au sAMAccountName
+                $user = Get-ADUser -Filter "sAMAccountName -eq '$SamAccount'" -SearchBase $SearchBase -Properties *
+                if ($null -eq $user) {
+                    return "Utilisateur '$SamAccount' non trouvé dans $SearchBase."
+                } else {
+                    return "Utilisateur trouvé : `r`nNom : $($user.Name)`r`nCompte : $($user.sAMAccountName)`r`nEmail : $($user.EmailAddress)"
+                }
+            } catch {
+                return "Erreur lors de la recherche AD : $_"
+            }
+        }
+
+        # ----- Par défaut : test inconnu -----
+        default {
+            return "Test inconnu : $TestName"
+        }
+    }
+}
+
+# Lancer l’interface
+Show-VMHealthForm
